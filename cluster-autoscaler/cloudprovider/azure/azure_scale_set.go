@@ -206,11 +206,31 @@ func (scaleSet *ScaleSet) getCurSize() (int64, error) {
 		return -1, rerr.Error()
 	}
 
+	capacity := *set.Sku.Capacity
+
+	// Get actual capacity based on VMs that are not deallocated
+	ctx, cancel := getContextWithCancel()
+	defer cancel()
+	var numberOfRunningVMs int64 = 0
+	resourceGroup := scaleSet.manager.config.ResourceGroup
+	vmList, rerr := scaleSet.manager.azClient.virtualMachineScaleSetVMsClient.List(ctx, resourceGroup, scaleSet.Name, "instanceView")
+	for _, vm := range vmList {
+		isVMRunning := true
+		for _, status := range *vm.VirtualMachineScaleSetVMProperties.InstanceView.Statuses {
+			if *status.Code == "PowerState/deallocated" {
+				isVMRunning = false
+			}
+		}
+		if isVMRunning {
+			numberOfRunningVMs++
+		}
+	}
+	capacity = numberOfRunningVMs
 	vmssSizeMutex.Lock()
-	curSize := *set.Sku.Capacity
+	curSize := capacity
 	vmssSizeMutex.Unlock()
 
-	klog.V(5).Infof("Getting scale set (%q) capacity: %d\n", scaleSet.Name, curSize)
+	klog.V(0).Infof("Getting scale set (%q) capacity: %d\n", scaleSet.Name, curSize)
 
 	if scaleSet.curSize != curSize {
 		// Invalidate the instance cache if the capacity has changed.
@@ -265,32 +285,75 @@ func (scaleSet *ScaleSet) SetScaleSetSize(size int64) error {
 		return rerr.Error()
 	}
 
-	// Update the new capacity to cache.
-	vmssSizeMutex.Lock()
-	vmssInfo.Sku.Capacity = &size
-	vmssSizeMutex.Unlock()
-
-	// Compose a new VMSS for updating.
-	op := compute.VirtualMachineScaleSet{
-		Name:     vmssInfo.Name,
-		Sku:      vmssInfo.Sku,
-		Location: vmssInfo.Location,
-	}
+	klog.V(0).Infof("SetScaleSetSize. Desired Size:- %d", size)
 	ctx, cancel := getContextWithCancel()
 	defer cancel()
-	klog.V(3).Infof("Waiting for virtualMachineScaleSetsClient.CreateOrUpdateAsync(%s)", scaleSet.Name)
-	future, rerr := scaleSet.manager.azClient.virtualMachineScaleSetsClient.CreateOrUpdateAsync(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op)
-	if rerr != nil {
-		klog.Errorf("virtualMachineScaleSetsClient.CreateOrUpdate for scale set %q failed: %v", scaleSet.Name, rerr)
-		return rerr.Error()
+	var numberOfRunningVMs = 0
+	resourceGroup := scaleSet.manager.config.ResourceGroup
+	deallocatedVmIds := make([]string, 0)
+	vmList, rerr := scaleSet.manager.azClient.virtualMachineScaleSetVMsClient.List(ctx, resourceGroup, scaleSet.Name, "instanceView")
+	for _, vm := range vmList {
+		isVMRunning := true
+		for _, status := range *vm.VirtualMachineScaleSetVMProperties.InstanceView.Statuses {
+			if *status.Code == "PowerState/deallocated" {
+				isVMRunning = false
+				deallocatedVmIds = append(deallocatedVmIds, *vm.InstanceID)
+			}
+		}
+		if isVMRunning {
+			numberOfRunningVMs++
+		}
+	}
+	var totalVMs = len(vmList)
+	klog.V(0).Infof("Total:- %d Running:- %d", totalVMs, numberOfRunningVMs)
+
+	if numberOfRunningVMs < totalVMs {
+		numberOfDeallocatedVMs := len(deallocatedVmIds)
+		klog.V(0).Infof("Desired:- %d. Running:- %d Deallocated:- %d", size, numberOfRunningVMs, numberOfDeallocatedVMs)
+		numVMsToStart := (int(size) - numberOfRunningVMs)
+		if numVMsToStart > numberOfDeallocatedVMs {
+			numVMsToStart = numberOfDeallocatedVMs // min of them both
+		}
+		klog.V(0).Infof("Number to start:- %d", numVMsToStart)
+		vmids := make([]string, 0)
+		for i := 0; i < numVMsToStart; i++ {
+			vmids = append(vmids, deallocatedVmIds[i])
+		}
+		requiredIds := &compute.VirtualMachineScaleSetVMInstanceRequiredIDs{
+			InstanceIds: &vmids,
+		}
+		scaleSet.manager.azClient.virtualMachineScaleSetsClient.StartInstances(ctx, resourceGroup, scaleSet.Id(), *requiredIds)
 	}
 
-	// Proactively set the VMSS size so autoscaler makes better decisions.
-	scaleSet.curSize = size
-	scaleSet.lastSizeRefresh = time.Now()
+	if totalVMs < int(size) {
+		klog.V(0).Infof("Additional capacity needed:- %d. Update total capacity of VMSS to %d", &size)
+		// Update the new capacity to cache.
+		vmssSizeMutex.Lock()
+		vmssInfo.Sku.Capacity = &size
+		vmssSizeMutex.Unlock()
 
-	klog.V(3).Infof("create a goroutine to wait for the result of the virtualMachineScaleSetsClient.CreateOrUpdate request")
-	go scaleSet.updateVMSSCapacity(future)
+		// Compose a new VMSS for updating.
+		op := compute.VirtualMachineScaleSet{
+			Name:     vmssInfo.Name,
+			Sku:      vmssInfo.Sku,
+			Location: vmssInfo.Location,
+		}
+		ctx, cancel := getContextWithCancel()
+		defer cancel()
+		klog.V(3).Infof("Waiting for virtualMachineScaleSetsClient.CreateOrUpdateAsync(%s)", scaleSet.Name)
+		future, rerr := scaleSet.manager.azClient.virtualMachineScaleSetsClient.CreateOrUpdateAsync(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op)
+		if rerr != nil {
+			klog.Errorf("virtualMachineScaleSetsClient.CreateOrUpdate for scale set %q failed: %v", scaleSet.Name, rerr)
+			return rerr.Error()
+		}
+
+		// Proactively set the VMSS size so autoscaler makes better decisions.
+		scaleSet.curSize = size
+		scaleSet.lastSizeRefresh = time.Now()
+
+		klog.V(3).Infof("create a goroutine to wait for the result of the virtualMachineScaleSetsClient.CreateOrUpdate request")
+		go scaleSet.updateVMSSCapacity(future)
+	}
 
 	return nil
 }
@@ -476,7 +539,64 @@ func (scaleSet *ScaleSet) DeleteNodes(nodes []*apiv1.Node) error {
 		refs = append(refs, ref)
 	}
 
-	return scaleSet.DeleteInstances(refs)
+	return scaleSet.DeallocateInstances(refs)
+	//return scaleSet.DeleteInstances(refs)
+}
+
+// DeallocateInstances deallocates the given instances. All instances must be controlled by the same ASG.
+func (scaleSet *ScaleSet) DeallocateInstances(instances []*azureRef) error {
+	if len(instances) == 0 {
+		return nil
+	}
+
+	klog.V(3).Infof("Deallocating vmss instances %v", instances)
+
+	commonAsg, err := scaleSet.manager.GetAsgForInstance(instances[0])
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := getContextWithCancel()
+	defer cancel()
+	resourceGroup := scaleSet.manager.config.ResourceGroup
+
+	instanceIDs := []string{}
+	for _, instance := range instances {
+
+		asg, err := scaleSet.manager.GetAsgForInstance(instance)
+		if err != nil {
+			return err
+		}
+
+		if !strings.EqualFold(asg.Id(), commonAsg.Id()) {
+			return fmt.Errorf("cannot deallocate instance (%s) which don't belong to the same Scale Set (%q)", instance.Name, commonAsg)
+		}
+
+		instanceID, err := getLastSegment(instance.Name)
+		if err != nil {
+			klog.Errorf("getLastSegment failed with error: %v", err)
+			return err
+		}
+
+		instanceIDs = append(instanceIDs, instanceID)
+	}
+
+	requiredIds := &compute.VirtualMachineScaleSetVMInstanceRequiredIDs{
+		InstanceIds: &instanceIDs,
+	}
+
+	// Proactively decrement scale set size so that we don't
+	// go below minimum node count if cache data is stale
+	scaleSet.sizeMutex.Lock()
+	scaleSet.curSize--
+	scaleSet.sizeMutex.Unlock()
+
+	rerr := scaleSet.manager.azClient.virtualMachineScaleSetsClient.DeallocateInstances(ctx, resourceGroup, commonAsg.Id(), *requiredIds)
+	if rerr != nil {
+		klog.Errorf("Failed to deallocate instances %v. Invalidating the cache to get the real scale set size", requiredIds)
+		scaleSet.invalidateStatusCacheWithLock()
+	}
+	return rerr.Error()
 }
 
 // Id returns ScaleSet id.
