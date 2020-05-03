@@ -16,7 +16,7 @@ if ! which jq > /dev/null; then
 fi
 
 SCRIPT_NAME=$(basename "$0")
-K8S_FORK=${K8S_FORK:-"git@github.com:kubernetes/kubernetes.git"}
+K8S_FORK=${K8S_FORK:-"https://github.com/kubernetes/kubernetes.git"}
 K8S_REV="master"
 BATCH_MODE="false"
 TARGET_MODULE=${TARGET_MODULE:-k8s.io/autoscaler/cluster-autoscaler}
@@ -41,7 +41,7 @@ done
 export GO111MODULE=on
 
 set -o errexit
-WORK_DIR="${WORK_DIR:-$(mktemp -d /tmp/ca-update-vendor.XXXX)}"
+WORK_DIR="${WORK_DIR:-/tmp/ca-update-vendor.1234}"
 echo "Operating in ${WORK_DIR}"
 
 if [ ! -d $WORK_DIR ]; then
@@ -98,7 +98,7 @@ set +o errexit
   }
 
   # Deleting old stuff
-  rm -rf vendor
+  #rm -rf vendor
   rm -f go.mod
   rm -f go.sum
 
@@ -204,7 +204,7 @@ set +o errexit
   echo "Operation finished successfully"
   if [[ "$(basename "${WORK_DIR}" | cut -d '.' -f 1)" == "ca-update-vendor" ]];then
     echo "Deleting working directory ${WORK_DIR}"
-    rm -rf ${WORK_DIR}
+    #rm -rf ${WORK_DIR}
   else
     echo "Preserving working directory ${WORK_DIR}"
   fi
