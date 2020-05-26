@@ -326,7 +326,7 @@ func (scaleSet *ScaleSet) SetScaleSetSize(size int64) error {
 	}
 
 	if totalVMs < int(size) {
-		klog.V(0).Infof("Additional capacity needed:- %d. Update total capacity of VMSS to %d", &size)
+		klog.V(0).Infof("Additional capacity needed:- %d. Update total capacity of VMSS to %d", size)
 		// Update the new capacity to cache.
 		vmssSizeMutex.Lock()
 		vmssInfo.Sku.Capacity = &size
